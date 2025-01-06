@@ -1,0 +1,216 @@
+from flask import Flask, request, render_template_string, send_file
+from astropy.io import fits
+from astropy.convolution import convolve
+from reproject import reproject_interp
+import numpy as np
+from radio_beam import Beam
+from astropy.wcs import WCS
+from astropy import units as u
+import os
+import re
+
+app = Flask(__name__)
+
+# Increase file size limit to 45 MB
+app.config['MAX_CONTENT_LENGTH'] = 45 * 1024 * 1024  # 45 MB
+
+UPLOAD_FOLDER = os.path.abspath("uploads")
+RESULT_FOLDER = os.path.abspath("results")
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+os.makedirs(RESULT_FOLDER, exist_ok=True)
+
+# Helper function to sanitize file names
+def secure_filename(filename):
+    return re.sub(r'[^a-zA-Z0-9_.-]', '_', filename)
+
+# Helper function to convolve data to a target resolution
+def convolve_if_needed(data, original_beam, target_beam, pixel_scale):
+    """
+    Convolve data to match a target beam resolution if needed.
+
+    Parameters:
+    - data: 2D array of image data
+    - original_beam: Beam object representing the current resolution
+    - target_beam: Beam object representing the target resolution
+    - pixel_scale: Pixel scale of the image in degrees
+
+    Returns:
+    - Convolved data if necessary, otherwise the original data.
+    """
+    try:
+        if target_beam > original_beam:
+            kernel = target_beam.deconvolve(original_beam).as_kernel(pixel_scale)
+            return convolve(data, kernel)
+        return data
+    except Exception as e:
+        print(f"Convolution error: {e}")
+        return data  # Return the original data if convolution fails
+
+# HTML Template as a Python string
+HTML_TEMPLATE = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Spectral Index Analysis Tool</title>
+</head>
+<body>
+    <div style="max-width: 800px; margin: 50px auto; font-family: Arial, sans-serif;">
+        <h1>Spectral Index Analysis Tool</h1>
+        <form action="/calculate" method="post" enctype="multipart/form-data">
+            <label>Survey 1:</label>
+            <select name="survey1" required>
+                <option value="LOTSS">LOTSS</option>
+                <option value="VLASS">VLASS</option>
+                <option value="RACS_MID">RACS Mid</option>
+                <option value="RACS_LOW">RACS Low</option>
+                <option value="VLAF">VLAF</option>
+                <option value="TGSS">TGSS</option>
+                <option value="NVSS">NVSS</option>
+            </select>
+            <br>
+            <label>Survey 2:</label>
+            <select name="survey2" required>
+                <option value="LOTSS">LOTSS</option>
+                <option value="VLASS">VLASS</option>
+                <option value="RACS_MID">RACS Mid</option>
+                <option value="RACS_LOW">RACS Low</option>
+                <option value="VLAF">VLAF</option>
+                <option value="TGSS">TGSS</option>
+                <option value="NVSS">NVSS</option>
+            </select>
+            <br><br>
+            <label>FITS File 1:</label>
+            <input type="file" name="file1" accept=".fits" required>
+            <br>
+            <label>FITS File 2:</label>
+            <input type="file" name="file2" accept=".fits" required>
+            <br><br>
+            <button type="submit">Calculate Spectral Index</button>
+        </form>
+    </div>
+</body>
+</html>
+"""
+
+@app.route('/')
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route('/calculate', methods=['POST'])
+def calculate_spectral_index():
+    # Survey metadata with angular resolution
+    survey_data = {
+        'LOTSS': {'frequency': 144, 'sigma': 0.00024, 'resolution': 5},
+        'VLASS': {'frequency': 3000, 'sigma': 0.00021, 'resolution': 2.5},
+        'RACS_MID': {'frequency': 887.5, 'sigma': 0.0006, 'resolution': 10},
+        'RACS_LOW': {'frequency': 887.5, 'sigma': 0.00075, 'resolution': 15},
+        'VLAF': {'frequency': 1400, 'sigma': 0.0005, 'resolution': 5},
+        'TGSS': {'frequency': 150, 'sigma': 0.015, 'resolution': 25},
+        'NVSS': {'frequency': 1400, 'sigma': 0.0015, 'resolution': 45}
+    }
+
+    # Retrieve survey data
+    survey1 = request.form['survey1']
+    survey2 = request.form['survey2']
+    frequency1 = survey_data[survey1]['frequency']
+    frequency2 = survey_data[survey2]['frequency']
+    sigma1 = survey_data[survey1]['sigma']
+    sigma2 = survey_data[survey2]['sigma']
+    resolution1 = survey_data[survey1]['resolution']
+    resolution2 = survey_data[survey2]['resolution']
+
+    # Retrieve uploaded files
+    file1 = request.files['file1']
+    file2 = request.files['file2']
+
+    # Sanitize file names
+    file1_name = secure_filename(file1.filename)
+    file2_name = secure_filename(file2.filename)
+
+    # Save files in the uploads folder
+    file1_path = os.path.join(UPLOAD_FOLDER, file1_name)
+    file2_path = os.path.join(UPLOAD_FOLDER, file2_name)
+    file1.save(file1_path)
+    file2.save(file2_path)
+
+    # Helper function to reduce FITS data to 2D
+    def reduce_to_2d(data):
+        """
+        Reduce FITS data to 2D by slicing or collapsing extra dimensions.
+        Assumes the first two dimensions are spatial (x, y).
+        """
+        if data.ndim == 3:  # For 3D data, take the first slice along the 3rd axis
+            return data[0, :, :]
+        elif data.ndim == 4:  # For 4D data, take the first slice along the last two axes
+            return data[0, 0, :, :]
+        elif data.ndim == 2:  # Already 2D
+            return data
+        else:
+            raise ValueError(f"Unsupported data dimensions: {data.ndim}")
+
+    # Helper function to apply noise thresholding
+    def apply_sigma_threshold(data, sigma):
+        data[data < sigma] = 0  # Use the provided sigma value directly
+        return data
+
+    # Load FITS data
+    data1 = fits.getdata(file1_path)
+    header1 = fits.getheader(file1_path)
+    data2 = fits.getdata(file2_path)
+    header2 = fits.getheader(file2_path)
+
+    # Reduce data to 2D
+    data1 = reduce_to_2d(data1)
+    data2 = reduce_to_2d(data2)
+
+    # Apply noise thresholding
+    data1 = apply_sigma_threshold(data1, sigma1)
+    data2 = apply_sigma_threshold(data2, sigma2)
+
+    # Reproject data
+    wcs1 = WCS(header1, naxis=2)
+    wcs2 = WCS(header2, naxis=2)
+    data2_reprojected, _ = reproject_interp((data2, wcs2), wcs1, data1.shape)
+
+    # Convolve to common resolution if needed
+    beam1 = Beam(major=resolution1 * u.arcsec, minor=resolution1 * u.arcsec, pa=0 * u.deg)
+    beam2 = Beam(major=resolution2 * u.arcsec, minor=resolution2 * u.arcsec, pa=0 * u.deg)
+
+    if resolution1 > resolution2:
+        # Convolve the higher-resolution survey (survey2) to match the lower-resolution survey (survey1)
+        target_beam = beam1
+        pixel_scale = abs(header1['CDELT2']) * u.deg
+        data2_conv = convolve_if_needed(data2_reprojected, beam2, target_beam, pixel_scale)
+        data1_conv = data1  # No convolution needed for lower-resolution survey
+    else:
+        # Convolve the higher-resolution survey (survey1) to match the lower-resolution survey (survey2)
+        target_beam = beam2
+        pixel_scale = abs(header2['CDELT2']) * u.deg
+        data1_conv = convolve_if_needed(data1, beam1, target_beam, pixel_scale)
+        data2_conv = data2_reprojected  # No convolution needed for lower-resolution survey
+
+    # Reorder surveys to ensure consistent spectral index calculation
+    if frequency1 < frequency2:
+        data1_conv, data2_conv = data2_conv, data1_conv
+        frequency1, frequency2 = frequency2, frequency1
+        sigma1, sigma2 = sigma2, sigma1
+
+    # Avoid division errors
+    data2_conv[data2_conv == 0] = 1e-10  # Replace zero values in denominator with a small value
+
+    # Spectral Index Calculation
+    with np.errstate(divide='ignore', invalid='ignore'):
+        spectral_index = np.log(data1_conv / data2_conv) / np.log(frequency1 / frequency2)
+        spectral_index[np.isnan(spectral_index)] = 0
+
+    # Save result as FITS
+    result_path = os.path.join(RESULT_FOLDER, 'spectral_index.fits')
+    hdu = fits.PrimaryHDU(spectral_index, header=header1)
+    hdu.writeto(result_path, overwrite=True)
+
+    return send_file(result_path, as_attachment=True, download_name='spectral_index.fits')
+
+if __name__ == "__main__":
+    app.run(debug=True)
